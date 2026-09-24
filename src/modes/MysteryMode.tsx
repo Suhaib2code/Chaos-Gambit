@@ -1,11 +1,13 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ChessBoard } from "../components/ChessBoard";
-import { GameState, createInitialState, createMysteryInitialState, Square, Color, Move, getLegalMoves, applyMove, isCheckmate, moveToSAN, getMaterialState, PieceType } from "../game/engine";
+import { GameState, createMysteryInitialState, Square, Color, Move, getLegalMoves, applyMove, isCheckmate, moveToSAN, getMaterialState, PieceType } from "../game/engine";
 import { Button } from "../components/ui";
 import { ArrowLeft, RotateCcw, EyeOff, UserSearch, List as ListIcon, Undo2 } from "lucide-react";
 import { motion } from "motion/react";
 import { MoveLog } from "../components/MoveLog";
 import { PlayerBar } from "../components/PlayerBar";
+import { useVariantRules } from "../game/variantRules";
+import { saveArchivedGame, type ArchivePly } from "../game/archive";
 
 interface MysteryModeProps {
   onBack: () => void;
@@ -23,10 +25,14 @@ type MysteryHistoryState = {
 };
 
 export function MysteryMode({ onBack }: MysteryModeProps) {
+  const { rules } = useVariantRules();
   const [phase, setPhase] = useState<Phase>("interstitial");
   const [interstitialTarget, setInterstitialTarget] = useState<Phase | null>("p1_select");
   
   const [state, setState] = useState<GameState>(createMysteryInitialState());
+  const matchInitialState = useRef(state);
+  const matchPlies = useRef<ArchivePly[]>([]);
+  const matchStartedAt = useRef(new Date().toISOString());
   const [historyStates, setHistoryStates] = useState<MysteryHistoryState[]>(() => [
     {
       state: createMysteryInitialState(),
@@ -46,6 +52,7 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
   const [message, setMessage] = useState<string | null>("White: Get ready to securely pick your piece!");
   const [isGuessing, setIsGuessing] = useState(false);
   const [score, setScore] = useState({ w: 0, b: 0 });
+  const [matchOver, setMatchOver] = useState(false);
   const [wrongGuessMsg, setWrongGuessMsg] = useState<string | null>(null);
 
   const [selectedSquare, setSelectedSquare] = useState<{r:number, c:number} | null>(null);
@@ -54,8 +61,43 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
   const [moveHistory, setMoveHistory] = useState<string[]>([]);
   const [showLog, setShowLog] = useState(false);
 
-  const startRound = () => {
+  const archiveMatch = (winner: Color, finalState: GameState, termination: string) => {
+    const endedAt = new Date().toISOString();
+    saveArchivedGame({
+      id: `mystery-${matchStartedAt.current}`,
+      mode: "mystery",
+      title: `Mystery Piece — first to ${rules.mystery.roundsToWin}`,
+      players: { white: "White", black: "Black" },
+      startedAt: matchStartedAt.current,
+      endedAt,
+      result: winner === "w" ? "1-0" : "0-1",
+      termination,
+      initialState: matchInitialState.current,
+      plies: [...matchPlies.current, { state: finalState, notation: `${winner === "w" ? "White" : "Black"} wins the match`, action: "other" }],
+    });
+  };
+  const recordRoundWin = (winner: Color, messageText: string, finalState: GameState = state, termination = "Round win") => {
+    const wins = score[winner] + 1;
+    setScore((current) => ({ ...current, [winner]: current[winner] + 1 }));
+    const wonMatch = wins >= rules.mystery.roundsToWin;
+    if (wonMatch) {
+      setMatchOver(true);
+      archiveMatch(winner, finalState, termination);
+    }
+    return wonMatch ? `${messageText} Match won!` : messageText;
+  };
+  const startNewMatch = () => {
+    setScore({ w: 0, b: 0 }); setMatchOver(false);
+    matchPlies.current = [];
+    matchStartedAt.current = new Date().toISOString();
+    matchInitialState.current = createMysteryInitialState();
+    startRound(true);
+  };
+
+  const startRound = (newMatch = false) => {
+    setMatchOver(false);
     const freshState = createMysteryInitialState();
+    if (!newMatch && score.w + score.b > 0) matchPlies.current.push({ state: freshState, notation: `Round ${score.w + score.b + 1} setup`, action: "other" });
     setState(freshState);
     setHistoryStates([{
       state: freshState,
@@ -99,16 +141,18 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
   const opponentSecret = activePlayer === 'w' ? p2Secret : p1Secret;
 
   const handleSquareClick = (r: number, c: number, promotion?: PieceType) => {
-    if (selectedMoveIndex !== null) return;
+    if (selectedMoveIndex !== null || matchOver) return;
     const p = state.board[r][c];
 
     if (phase === "p1_select") {
       if (p && p.color === "w") {
+        matchPlies.current.push({ state, notation: "White privately selected a piece", action: "reveal" });
         setP1Secret({r, c});
         passDeviceTo("p2_select", "Pass device to Black to select their piece.");
       }
     } else if (phase === "p2_select") {
       if (p && p.color === "b") {
+        matchPlies.current.push({ state, notation: "Black privately selected a piece", action: "reveal" });
         setP2Secret({r, c});
         // Skip interstitial and go straight into play!
         setPhase("play");
@@ -117,10 +161,12 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
     } else if (phase === "play" && isGuessing) {
       if (p && p.color !== activePlayer) {
         if (r === opponentSecret?.r && c === opponentSecret?.c) {
-          setMessage(`CORRECT! It was the ${p.type.toUpperCase()}! ${activePlayer === 'w' ? 'White' : 'Black'} wins!`);
-          setScore(s => ({ ...s, [activePlayer]: s[activePlayer] + 1 }));
+          matchPlies.current.push({ state, notation: `Correct guess: ${p.type.toUpperCase()}`, action: "guess" });
+          const roundMessage = recordRoundWin(activePlayer, `CORRECT! It was the ${p.type.toUpperCase()}! ${activePlayer === 'w' ? 'White' : 'Black'} wins!`, state, "Correct guess");
+          setMessage(roundMessage);
           setPhase("p1_select"); // Wait for manual restart
         } else {
+          matchPlies.current.push({ state, notation: `Incorrect guess on ${p.type.toUpperCase()}`, action: "guess" });
           setIsGuessing(false);
           setWrongGuessMsg("FALSE! Incorrect Guess.");
           const nextPlayer = activePlayer === 'w' ? 'b' : 'w';
@@ -135,6 +181,7 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
       if (move) {
         const nextState = applyMove(state, move);
         const san = moveToSAN(state, move, nextState);
+        matchPlies.current.push({ state: nextState, notation: san, action: "move" });
         setMoveHistory(prev => [...prev, san]);
 
         // Keep track of secrets if they move!
@@ -150,9 +197,8 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
 
         // Did we capture the opponent's secret? If so, instant win!
         if (opponentSecret && move.to.r === opponentSecret.r && move.to.c === opponentSecret.c) {
-          const finishedMsg = `Secret Captured! ${activePlayer === 'w' ? 'White' : 'Black'} wins!`;
+          const finishedMsg = recordRoundWin(activePlayer, `Secret Captured! ${activePlayer === 'w' ? 'White' : 'Black'} wins!`, nextState, "Secret captured");
           setMessage(finishedMsg);
-          setScore(s => ({ ...s, [activePlayer]: s[activePlayer] + 1 }));
           setState(nextState);
           setPhase("p1_select");
           
@@ -172,7 +218,7 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
         let nextMessage = message;
 
         if (isCheckmate(nextState)) {
-          nextMessage = `${activePlayer === 'w' ? 'White' : 'Black'} Wins by Checkmate!`;
+          nextMessage = recordRoundWin(activePlayer, `${activePlayer === 'w' ? 'White' : 'Black'} Wins by Checkmate!`, nextState, "Checkmate");
           setMessage(nextMessage);
           nextPhase = "p1_select";
           setPhase("p1_select");
@@ -276,7 +322,7 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
           </Button>
           <div className="text-xl font-bold bg-[#1A1A1E] px-6 py-2 rounded-full border border-white/5 shadow-sm flex items-center gap-3">
              <span className="text-sm font-normal text-slate-500 uppercase tracking-widest">Rounds</span>
-             <span className="text-white">W {score.w}</span> <span className="text-slate-600 font-normal">|</span> <span className="text-slate-400">B {score.b}</span>
+             <span className="text-white">W {score.w}</span> <span className="text-slate-600 font-normal">|</span> <span className="text-slate-400">B {score.b}</span><span className="ml-2 text-slate-500">first to {rules.mystery.roundsToWin}</span>
           </div>
           <div className="flex gap-4">
              <Button 
@@ -287,7 +333,7 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
              >
                 <Undo2 className="w-4 h-4 mr-2" /> Undo
              </Button>
-             <Button onClick={() => setShowLog(!showLog)} variant="outline" className="text-slate-300 border-white/10 hover:bg-white/5">
+             <Button onClick={() => setShowLog(!showLog)} aria-expanded={showLog} aria-controls="move-log-panel" variant="outline" className="text-slate-300 border-white/10 hover:bg-white/5">
                 <ListIcon className="w-4 h-4 mr-2" /> Move Log
              </Button>
           </div>
@@ -350,19 +396,19 @@ export function MysteryMode({ onBack }: MysteryModeProps) {
               )}
               
               {phase === "p1_select" && message.includes("CORRECT") && (
-                <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 rounded-lg backdrop-blur-sm">
+                <div role="dialog" aria-modal="true" aria-label={message} className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 rounded-lg backdrop-blur-sm">
                    <div className="bg-[#1A1A1E] p-10 rounded-3xl text-center border border-green-500/30 shadow-2xl shadow-green-500/20 max-w-md w-full mx-4">
                       <h2 className="text-4xl font-bold text-green-400 mb-2 uppercase tracking-tight">{message.split('!')[0]}!</h2>
                       <p className="text-slate-300 mb-8">{message.split('!').slice(1).join('!').trim()}</p>
-                      <Button onClick={startRound} className="w-full py-6 text-lg rounded-2xl bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-500/20">Next Round</Button>
+                      <Button autoFocus onClick={matchOver ? startNewMatch : startRound} className="w-full py-6 text-lg rounded-2xl bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-500/20">{matchOver ? "Start New Match" : "Next Round"}</Button>
                    </div>
                 </div>
               )}
               {phase === "p1_select" && (message.includes("Captured") || message.includes("Checkmate")) && (
-                <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 rounded-lg backdrop-blur-sm">
+                <div role="dialog" aria-modal="true" aria-label={message} className="absolute inset-0 bg-black/80 flex items-center justify-center z-50 rounded-lg backdrop-blur-sm">
                    <div className="bg-[#1A1A1E] p-10 rounded-3xl text-center border border-red-500/30 shadow-2xl shadow-red-500/20 max-w-md w-full mx-4">
                       <h2 className="text-4xl font-bold text-red-400 mb-6 uppercase tracking-tight">{message}</h2>
-                      <Button onClick={startRound} className="w-full py-6 text-lg rounded-2xl bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-500/20">Next Round</Button>
+                      <Button autoFocus onClick={matchOver ? startNewMatch : startRound} className="w-full py-6 text-lg rounded-2xl bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-500/20">{matchOver ? "Start New Match" : "Next Round"}</Button>
                    </div>
                 </div>
               )}

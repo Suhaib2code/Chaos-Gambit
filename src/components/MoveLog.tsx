@@ -119,6 +119,8 @@ export function MoveLog({ show, onClose, moveHistory, selectedMoveIndex = null, 
     <AnimatePresence>
       {show && (
         <motion.div
+          id="move-log-panel"
+          aria-labelledby="move-log-title"
           initial={{ opacity: 0, x: 50 }}
           animate={{ opacity: 1, x: 0 }}
           exit={{ opacity: 0, x: 50 }}
@@ -126,10 +128,10 @@ export function MoveLog({ show, onClose, moveHistory, selectedMoveIndex = null, 
         >
           <div className="p-4 border-b border-white/5 flex justify-between items-center">
             <div className="flex flex-col">
-              <h3 className="text-xl font-bold text-white tracking-widest uppercase">Move Log</h3>
+              <h3 id="move-log-title" className="text-xl font-bold text-white tracking-widest uppercase">Move Log</h3>
               <span className="text-[10px] text-slate-500 font-medium">Click a move to view historic state</span>
             </div>
-            <Button onClick={onClose} variant="ghost" className="p-2 h-auto text-slate-400 hover:text-white hover:bg-white/5">
+            <Button onClick={onClose} variant="ghost" aria-label="Close move log" className="p-2 h-11 w-11 text-slate-400 hover:text-white hover:bg-white/5">
               <X className="w-5 h-5" />
             </Button>
           </div>

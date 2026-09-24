@@ -23,6 +23,10 @@ export type GameState = {
 export type GameOptions = {
   ignoreCheck?: boolean;
   jumpSquare?: Square | null;
+  /** Lets a sliding Spellbound piece pass through occupied squares for its charged move. */
+  phaseJump?: boolean;
+  /** Square occupied by the Duck Chess blocker. It stops rays and cannot be landed on. */
+  blockedSquare?: Square | null;
   frozenSquares?: Square[];
 };
 
@@ -89,11 +93,13 @@ export function getPseudoLegalMoves(state: GameState, r: number, c: number, opti
   const color = piece.color;
   const dir = color === 'w' ? -1 : 1;
   const startRow = color === 'w' ? 6 : 1;
+  const isBlocked = (tr: number, tc: number) => options.blockedSquare?.r === tr && options.blockedSquare?.c === tc;
   
   const isFrozen = options.frozenSquares?.some(sq => sq.r === r && sq.c === c);
   if (isFrozen) return [];
 
   const addMove = (tr: number, tc: number, captured?: Piece) => {
+    if (isBlocked(tr, tc)) return;
     if (piece.type === 'p' && (tr === 0 || tr === 7)) {
       moves.push({ from: {r, c}, to: {r: tr, c: tc}, captured, promotion: 'q' });
       moves.push({ from: {r, c}, to: {r: tr, c: tc}, captured, promotion: 'r' });
@@ -107,9 +113,9 @@ export function getPseudoLegalMoves(state: GameState, r: number, c: number, opti
   const isJumpSq = (tr: number, tc: number) => options.jumpSquare?.r === tr && options.jumpSquare?.c === tc;
 
   if (piece.type === 'p') {
-    if (inBounds(r + dir, c) && !state.board[r + dir][c]) {
+    if (inBounds(r + dir, c) && !state.board[r + dir][c] && !isBlocked(r + dir, c)) {
       addMove(r + dir, c);
-      if (r === startRow && !state.board[r + dir * 2][c]) {
+      if (r === startRow && !state.board[r + dir * 2][c] && !isBlocked(r + dir * 2, c)) {
         addMove(r + dir * 2, c);
       }
     }
@@ -149,10 +155,14 @@ export function getPseudoLegalMoves(state: GameState, r: number, c: number, opti
     }
     if (piece.type === 'k') {
       const castlingBits = state.castling[color];
-      if (castlingBits.k && !state.board[r][5] && !state.board[r][6]) {
+      const homeRow = color === 'w' ? 7 : 0;
+      const kingOnHomeSquare = r === homeRow && c === 4;
+      const kingRook = state.board[homeRow][7];
+      const queenRook = state.board[homeRow][0];
+      if (kingOnHomeSquare && castlingBits.k && kingRook?.type === 'r' && kingRook.color === color && !state.board[r][5] && !state.board[r][6] && !isBlocked(r, 5) && !isBlocked(r, 6)) {
         moves.push({ from: {r, c}, to: {r, c: c + 2} });
       }
-      if (castlingBits.q && !state.board[r][1] && !state.board[r][2] && !state.board[r][3]) {
+      if (kingOnHomeSquare && castlingBits.q && queenRook?.type === 'r' && queenRook.color === color && !state.board[r][1] && !state.board[r][2] && !state.board[r][3] && !isBlocked(r, 1) && !isBlocked(r, 2) && !isBlocked(r, 3)) {
         moves.push({ from: {r, c}, to: {r, c: c - 2} });
       }
     }
@@ -160,11 +170,17 @@ export function getPseudoLegalMoves(state: GameState, r: number, c: number, opti
     for (const [dr, dc] of OFFSETS[piece.type]) {
       let tr = r + dr, tc = c + dc;
       while (inBounds(tr, tc)) {
+        if (isBlocked(tr, tc)) break;
         const target = state.board[tr][tc];
         const jump = isJumpSq(tr, tc);
         if (!target) {
           addMove(tr, tc);
         } else {
+          if (options.phaseJump) {
+            tr += dr;
+            tc += dc;
+            continue;
+          }
           if (target.color !== color) addMove(tr, tc, target);
           if (!jump) break;
         }
@@ -174,6 +190,19 @@ export function getPseudoLegalMoves(state: GameState, r: number, c: number, opti
     }
   }
   return moves;
+}
+
+/** Applies a move only when it exactly matches the current side's generated legal moves. */
+export function applyLegalMove(state: GameState, move: Move, options: GameOptions = {}): GameState | null {
+  const validSquare = (square: Square) => Number.isInteger(square?.r) && Number.isInteger(square?.c) && square.r >= 0 && square.r < 8 && square.c >= 0 && square.c < 8;
+  if (!move || !validSquare(move.from) || !validSquare(move.to)) return null;
+  const piece = state.board[move.from.r]?.[move.from.c];
+  if (!piece || piece.color !== state.turn) return null;
+  if (move.promotion !== undefined && !(['q', 'r', 'b', 'n'] as PieceType[]).includes(move.promotion)) return null;
+  const legal = getLegalMoves(state, move.from.r, move.from.c, options).find(candidate =>
+    candidate.to.r === move.to.r && candidate.to.c === move.to.c && candidate.promotion === move.promotion
+  );
+  return legal ? applyMove(state, legal) : null;
 }
 
 export function applyMove(state: GameState, move: Move): GameState {
@@ -417,10 +446,12 @@ export function moveToSAN(state: GameState, move: Move, nextState?: GameState, o
     finalState = applyMove(state, move);
   }
 
-  if (isCheckmate(finalState)) {
-    moveStr += '#';
-  } else if (isCheck(finalState, finalState.turn)) {
-    moveStr += '+';
+  if (!options.ignoreCheck) {
+    if (isCheckmate(finalState)) {
+      moveStr += '#';
+    } else if (isCheck(finalState, finalState.turn)) {
+      moveStr += '+';
+    }
   }
 
   return moveStr;

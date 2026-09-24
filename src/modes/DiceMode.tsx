@@ -1,13 +1,14 @@
-import { useState } from "react";
-import { ChessBoard, CustomBishopSVG, CustomKingSVG } from "../components/ChessBoard";
+import { useRef, useState } from "react";
+import { ChessBoard, ChessPieceSVG } from "../components/ChessBoard";
 import { GameState, createInitialState, Move, getLegalMoves, applyMove, PieceType, isCheckmate, isStalemate, moveToSAN, getMaterialState } from "../game/engine";
 import { Button } from "../components/ui";
 import { ArrowLeft, Dices, RotateCcw, List as ListIcon, Undo2 } from "lucide-react";
-import { PIECE_SYMBOLS } from "../components/Pieces";
 import { useSettings } from "../context";
 import { motion } from "motion/react";
 import { MoveLog } from "../components/MoveLog";
 import { PlayerBar } from "../components/PlayerBar";
+import { useVariantRules } from "../game/variantRules";
+import { saveArchivedGame } from "../game/archive";
 
 interface DiceModeProps {
   onBack: () => void;
@@ -31,8 +32,16 @@ const getGamePhase = (board: (any | null)[][], fullMoves: number): 'opening' | '
   return 'opening';
 };
 
-const getRandomPieceWithWeights = (phase: 'opening' | 'middlegame' | 'endgame'): PieceType => {
+const getRandomPieceWithWeights = (phase: 'opening' | 'middlegame' | 'endgame', profile: 'phase' | 'balanced' | 'chaos'): PieceType => {
   const rand = Math.random() * 100;
+  if (profile === 'balanced') {
+    if (rand < 16.67) return 'k'; if (rand < 33.34) return 'q'; if (rand < 50.01) return 'r';
+    if (rand < 66.68) return 'b'; if (rand < 83.35) return 'n'; return 'p';
+  }
+  if (profile === 'chaos') {
+    if (rand < 8) return 'k'; if (rand < 30) return 'q'; if (rand < 48) return 'r';
+    if (rand < 65) return 'b'; if (rand < 82) return 'n'; return 'p';
+  }
   if (phase === 'opening') {
     // King: 2%, Queen: 8%, Rook: 18%, Bishop: 18%, Knight: 18%, Pawn: 36%
     if (rand < 2) return 'k';
@@ -68,6 +77,8 @@ type DiceHistoryState = {
 
 export function DiceMode({ onBack }: DiceModeProps) {
   const { settings } = useSettings();
+  const { rules } = useVariantRules();
+  const startedAt = useRef(new Date().toISOString());
   const [state, setState] = useState<GameState>(createInitialState());
   const [historyStates, setHistoryStates] = useState<DiceHistoryState[]>(() => [
     { state: createInitialState(), diceRolls: [], hasRolled: false }
@@ -91,16 +102,12 @@ export function DiceMode({ onBack }: DiceModeProps) {
     setIsRolling(true);
     setTimeout(() => {
       const currentPhase = getGamePhase(state.board, state.fullMoves);
-      const rolls = [
-        getRandomPieceWithWeights(currentPhase),
-        getRandomPieceWithWeights(currentPhase),
-        getRandomPieceWithWeights(currentPhase),
-      ];
+      const rolls = Array.from({ length: rules.dice.rollsPerTurn }, () => getRandomPieceWithWeights(currentPhase, rules.dice.weightProfile));
 
       // Ensure the first move of both White and Black starts fairly with at least one pawn
       if (state.fullMoves === 1) {
         if (!rolls.includes('p')) {
-          rolls[Math.floor(Math.random() * 3)] = 'p';
+          rolls[Math.floor(Math.random() * rolls.length)] = 'p';
         }
       }
 
@@ -170,12 +177,14 @@ export function DiceMode({ onBack }: DiceModeProps) {
     const move = legalMoves.find(m => m.to.r === r && m.to.c === c && (!m.promotion || m.promotion === promotion));
     if (move) {
       const targetPiece = state.board[r][c];
-      const isKingCapture = targetPiece?.type === 'k';
+      const isKingCapture = targetPiece?.type === 'k' && rules.dice.kingCapture === 'capture-king';
+      if (targetPiece?.type === 'k' && rules.dice.kingCapture === 'checkmate') return;
 
       const nextState = applyMove(state, move);
       
       // Calculate isCheckmate and SAN before overriding nextState.turn
       const opCheckmate = isCheckmate(nextState);
+      const opStalemate = isStalemate(nextState);
       let san = moveToSAN(state, move, nextState);
       if (isKingCapture && !san.endsWith('#')) {
         san += '#';
@@ -193,6 +202,7 @@ export function DiceMode({ onBack }: DiceModeProps) {
       }]);
 
       if (isKingCapture) {
+        archiveFinishedGame("King capture", nextState, san);
         setState(nextState);
         setStatus(`${state.turn === 'w' ? 'White' : 'Black'} wins by King Capture!`);
         return;
@@ -200,8 +210,16 @@ export function DiceMode({ onBack }: DiceModeProps) {
 
       // intercept standard checkmate check
       if (opCheckmate) {
+        archiveFinishedGame("Checkmate", nextState, san);
         setState(nextState);
         setStatus(`${state.turn === 'w' ? 'White' : 'Black'} wins by Checkmate!`);
+        return;
+      }
+
+      if (opStalemate) {
+        archiveFinishedGame("Stalemate", nextState, san, "1/2-1/2");
+        setState(nextState);
+        setStatus("Draw by Stalemate.");
         return;
       }
       
@@ -231,6 +249,7 @@ export function DiceMode({ onBack }: DiceModeProps) {
   };
 
   const restart = () => {
+    startedAt.current = new Date().toISOString();
     const freshState = createInitialState();
     setState(freshState);
     setHistoryStates([{ state: freshState, diceRolls: [], hasRolled: false }]);
@@ -241,6 +260,30 @@ export function DiceMode({ onBack }: DiceModeProps) {
     setDiceRolls([]);
     setHasRolled(false);
     setMoveHistory([]);
+  };
+
+  const archiveFinishedGame = (termination: string, finalState: GameState, finalNotation: string, resultOverride?: '1-0' | '0-1' | '1/2-1/2') => {
+    const previousNotations = [...moveHistory];
+    const previousStates = historyStates.slice(1).map((entry) => entry.state);
+    const allNotations = [...previousNotations, finalNotation];
+    const allStates = [...previousStates, finalState];
+    const whiteWon = state.turn === "w";
+    saveArchivedGame({
+      id: `dice-${startedAt.current}`,
+      mode: "dice",
+      title: "Dice Gambit",
+      players: { white: "Noob 1", black: "Noob 2" },
+      startedAt: startedAt.current,
+      endedAt: new Date().toISOString(),
+      result: resultOverride ?? (whiteWon ? "1-0" : "0-1"),
+      termination,
+      initialState: historyStates[0]?.state ?? createInitialState(),
+      plies: allNotations.map((notation, index) => ({
+        state: allStates[index] ?? finalState,
+        notation,
+        action: notation.startsWith("skip ") ? "roll" : "move",
+      })),
+    });
   };
 
   const undo = () => {
@@ -268,9 +311,9 @@ export function DiceMode({ onBack }: DiceModeProps) {
   const currentPhase = getGamePhase(displayState.board, displayState.fullMoves);
 
   return (
-    <div className="flex w-full h-screen max-h-screen overflow-hidden p-2 sm:p-4 md:p-6 animate-in fade-in duration-300 isolate">
+    <div className="game-shell flex w-full h-screen max-h-screen overflow-hidden p-2 sm:p-4 md:p-6 animate-in fade-in duration-300 isolate">
       <div className="flex-1 flex flex-col items-center justify-between max-w-4xl mx-auto h-full w-full relative">
-        <div className="w-full flex justify-between items-center px-4 shrink-0">
+        <div className="game-header w-full flex justify-between items-center px-4 shrink-0">
           <Button onClick={onBack} variant="ghost" className="text-slate-400 hover:text-white hover:bg-white/5">
             <ArrowLeft className="w-5 h-5 mr-2" /> Back
           </Button>
@@ -286,7 +329,7 @@ export function DiceMode({ onBack }: DiceModeProps) {
             >
               <Undo2 className="w-4 h-4 mr-2" /> Undo
             </Button>
-            <Button onClick={() => setShowLog(!showLog)} variant="outline" className="text-slate-300 border-white/10 hover:bg-white/5">
+            <Button onClick={() => setShowLog(!showLog)} aria-expanded={showLog} aria-controls="move-log-panel" variant="outline" className="text-slate-300 border-white/10 hover:bg-white/5">
               <ListIcon className="w-4 h-4 mr-2" /> Move Log
             </Button>
             <Button onClick={restart} variant="outline" className="border-white/10 text-slate-300 hover:text-white hover:bg-white/5">
@@ -295,9 +338,9 @@ export function DiceMode({ onBack }: DiceModeProps) {
           </div>
         </div>
 
-        <div className="flex-1 flex flex-row w-full max-w-5xl mx-auto gap-2 md:gap-6 items-center justify-center min-h-0 overflow-hidden py-2">
+        <div className="game-layout flex-1 flex flex-row w-full max-w-5xl mx-auto gap-2 md:gap-6 items-center justify-center min-h-0 overflow-hidden py-2">
           <div 
-            className="flex-1 w-full flex flex-col justify-center min-h-0 h-full mx-auto"
+            className="game-board-column flex-1 w-full flex flex-col justify-center min-h-0 h-full mx-auto"
             style={{ maxWidth: 'min(100%, calc(100vh - 220px))' }}
           >
             {isViewingHistory && (
@@ -326,7 +369,7 @@ export function DiceMode({ onBack }: DiceModeProps) {
                />
             </div>
     
-            <div className="relative w-full flex-1 min-h-0 flex items-center justify-center">
+            <div className="game-board-stage relative w-full flex-1 min-h-0 flex items-center justify-center">
               <ChessBoard
                 state={displayState}
                 onSquareClick={isViewingHistory ? undefined : handleSquareClick}
@@ -344,10 +387,10 @@ export function DiceMode({ onBack }: DiceModeProps) {
               )}
     
               {status && (
-                <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 rounded-xl backdrop-blur-sm">
+                <div role="dialog" aria-modal="true" aria-labelledby="dice-result-title" className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 rounded-xl backdrop-blur-sm">
                   <div className="bg-[#1A1A1E] p-10 rounded-3xl text-center border border-white/10 shadow-2xl">
-                    <h2 className="text-3xl font-bold text-white mb-8 tracking-wide">{status}</h2>
-                    <Button onClick={restart} className="bg-purple-600 hover:bg-purple-500 text-white px-8 py-3 rounded-xl w-full">
+                    <h2 id="dice-result-title" className="text-3xl font-bold text-white mb-8 tracking-wide">{status}</h2>
+                    <Button autoFocus onClick={restart} className="bg-purple-600 hover:bg-purple-500 text-white px-8 py-3 rounded-xl w-full">
                       Play Again
                     </Button>
                   </div>
@@ -375,22 +418,16 @@ export function DiceMode({ onBack }: DiceModeProps) {
                 >
                   <Dices className={isRolling ? "animate-spin mb-2 w-6 h-6 animate-pulse text-amber-500" : "mb-2 w-6 h-6"} />
                   <span className="text-[10px] md:text-sm font-bold text-center leading-tight">
-                    {isRolling ? "Rolling..." : "Roll\nDice"}
+                    {isRolling ? (settings.locale === 'ar' ? "جارٍ الرمي…" : "Rolling...") : settings.locale === 'ar' ? `ارمِ النرد ${rules.dice.rollsPerTurn} مرات` : `Roll ${rules.dice.rollsPerTurn}\nDice`}
                   </span>
                 </Button>
              ) : (
                 <div className="flex flex-col p-2 md:p-4 rounded-xl gap-2 md:gap-4 items-center w-full justify-center bg-[#1A1A1E] border border-white/10 min-h-24 md:min-h-32 shadow-lg">
-                  <span className="text-[10px] md:text-xs font-bold text-slate-400 uppercase tracking-widest text-center leading-tight">Next</span>
+               <span className="text-[10px] md:text-xs font-bold text-slate-400 uppercase tracking-widest text-center leading-tight">{settings.locale === 'ar' ? 'التالي' : 'Next'}</span>
                   <div className="flex flex-col gap-2">
                     {diceRolls.map((d, i) => (
                       <div key={i} className={`text-4xl md:text-5xl flex items-center justify-center w-12 h-12 mx-auto ${i === 0 && !isViewingHistory ? "text-amber-400 scale-110 drop-shadow-[0_0_8px_rgba(251,191,36,0.8)]" : "text-slate-500"}`}>
-                        {d === 'b' ? (
-                          <CustomBishopSVG fillStyle={settings.pieceStyle} className="w-[0.85em] h-[0.85em]" />
-                        ) : d === 'k' ? (
-                          <CustomKingSVG fillStyle={settings.pieceStyle} className="w-[0.85em] h-[0.85em]" />
-                        ) : (
-                          PIECE_SYMBOLS[settings.pieceStyle as keyof typeof PIECE_SYMBOLS][d as keyof typeof PIECE_SYMBOLS.solid]
-                        )}
+                        <ChessPieceSVG type={d} color="w" fillStyle={settings.pieceStyle} className="w-[0.85em] h-[0.85em]" />
                       </div>
                     ))}
                   </div>
@@ -399,10 +436,10 @@ export function DiceMode({ onBack }: DiceModeProps) {
 
              <div className="text-[10px] font-medium text-center text-slate-400 bg-white/[0.03] border border-white/5 p-2 rounded-xl w-full">
                <div className="text-amber-400 font-bold uppercase tracking-wider text-[9px]">
-                 {currentPhase === 'opening' ? 'Opening' : currentPhase === 'middlegame' ? 'Middle' : 'Endgame'}
+                 {settings.locale === 'ar' ? (currentPhase === 'opening' ? 'الافتتاح' : currentPhase === 'middlegame' ? 'منتصف المباراة' : 'نهاية المباراة') : (currentPhase === 'opening' ? 'Opening' : currentPhase === 'middlegame' ? 'Middle' : 'Endgame')}
                </div>
                <div className="text-slate-500 text-[8px] mt-0.5 leading-tight">
-                 King: {currentPhase === 'opening' ? '2%' : currentPhase === 'middlegame' ? '12%' : '25%'}
+                 {settings.locale === 'ar' ? (rules.dice.weightProfile === 'phase' ? `احتمال الملك: ${currentPhase === 'opening' ? '٢' : currentPhase === 'middlegame' ? '١٢' : '٢٥'}٪` : rules.dice.weightProfile === 'balanced' ? 'احتمالات متساوية لكل قطعة' : 'الملك ٨٪ · الوزير ٢٢٪') : rules.dice.weightProfile === 'phase' ? `King: ${currentPhase === 'opening' ? '2%' : currentPhase === 'middlegame' ? '12%' : '25%'}` : rules.dice.weightProfile === 'balanced' ? 'Even odds for each piece' : 'King 8% · Queen 22%'}<br />{settings.locale === 'ar' ? (rules.dice.kingCapture === 'capture-king' ? 'أسر الملك أو كش مات' : 'كش مات فقط') : rules.dice.kingCapture === 'capture-king' ? 'King capture or checkmate' : 'Checkmate only'}
                </div>
              </div>
           </div>
@@ -424,13 +461,7 @@ export function DiceMode({ onBack }: DiceModeProps) {
                      transition={{ delay: i * 0.2 + 0.1 }}
                      className="text-7xl md:text-9xl text-amber-400 drop-shadow-[0_0_25px_rgba(251,191,36,0.6)] flex items-center justify-center w-24 h-24 md:w-36 md:h-36"
                    >
-                     {d === 'b' ? (
-                       <CustomBishopSVG fillStyle={settings.pieceStyle} className="w-[0.85em] h-[0.85em]" />
-                     ) : d === 'k' ? (
-                       <CustomKingSVG fillStyle={settings.pieceStyle} className="w-[0.85em] h-[0.85em]" />
-                     ) : (
-                       PIECE_SYMBOLS[settings.pieceStyle as keyof typeof PIECE_SYMBOLS][d as keyof typeof PIECE_SYMBOLS.solid]
-                     )}
+                     <ChessPieceSVG type={d} color="w" fillStyle={settings.pieceStyle} className="w-[0.85em] h-[0.85em]" />
                    </motion.div>
                 ))}
              </motion.div>

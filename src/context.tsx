@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, ReactNode } from "react";
 
 export interface Settings {
+  locale: "en" | "ar";
   theme: "classic" | "walnut" | "midnight" | "ice";
   pieceStyle: "solid" | "flat";
   soundEnabled: boolean;
@@ -11,6 +12,7 @@ export interface Settings {
 }
 
 export const defaultSettings: Settings = {
+  locale: "en",
   theme: "midnight",
   pieceStyle: "solid",
   soundEnabled: true,
@@ -33,7 +35,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       const saved = localStorage.getItem("chess_app_settings");
       if (saved) {
         const parsed = JSON.parse(saved);
-        return { ...defaultSettings, ...parsed };
+        return { ...defaultSettings, ...parsed, locale: parsed.locale === "ar" ? "ar" : "en" };
       }
     } catch (e) {
       console.error("Error loading settings from localStorage", e);

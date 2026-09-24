@@ -1,11 +1,15 @@
-import { useState } from "react";
-import { ChessBoard } from "../components/ChessBoard";
-import { GameState, createInitialState, Move, getLegalMoves, applyMove, Square, Color, moveToSAN, getMaterialState, PieceType } from "../game/engine";
+import { useRef, useState } from "react";
+import { ChessBoard, type SpellJumpAnimation } from "../components/ChessBoard";
+import { GameState, createInitialState, Move, getLegalMoves, applyMove, Square, Color, moveToSAN, getMaterialState, PieceType, isCheckmate, isStalemate } from "../game/engine";
 import { Button } from "../components/ui";
 import { ArrowLeft, RotateCcw, Snowflake, Wand2, List as ListIcon, Undo2 } from "lucide-react";
 import { motion } from "motion/react";
 import { MoveLog } from "../components/MoveLog";
 import { PlayerBar } from "../components/PlayerBar";
+import { useVariantRules } from "../game/variantRules";
+import { GameArchive } from "../components/GameArchive";
+import { GameResultOverlay } from "../components/GameResultOverlay";
+import { saveArchivedGame, type ArchivePly } from "../game/archive";
 
 interface SpellModeProps {
   onBack: () => void;
@@ -16,6 +20,17 @@ type SpellsState = {
   jumpLeft: number;
   freezeCooldown: number;
   jumpCooldown: number;
+};
+type FrozenSquare = { r: number; c: number; castBy: Color; remainingTurns: number; castId?: number; center?: Square };
+const makeSpells = (freezeUses: number, jumpUses: number): Record<Color, SpellsState> => ({
+  w: { freezeLeft: freezeUses, jumpLeft: jumpUses, freezeCooldown: 0, jumpCooldown: 0 },
+  b: { freezeLeft: freezeUses, jumpLeft: jumpUses, freezeCooldown: 0, jumpCooldown: 0 },
+});
+const newGameId = () => globalThis.crypto?.randomUUID?.() ?? `spell-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const actionForNotation = (notation: string): ArchivePly['action'] => {
+  if (notation.startsWith('[Freeze')) return 'freeze';
+  if (notation.startsWith('[Jump')) return 'jump';
+  return 'move';
 };
 
 function PlayerSpellsCard({
@@ -117,22 +132,26 @@ function PlayerSpellsCard({
 
 type SpellHistoryState = {
   state: GameState;
-  frozenSquares: { r: number; c: number; castBy: Color }[];
+  frozenSquares: FrozenSquare[];
   activeJump: Square | null;
   spells: Record<Color, SpellsState>;
 };
 
 export function SpellMode({ onBack }: SpellModeProps) {
+  const { rules } = useVariantRules();
+  const spellRules = rules.spell;
+  const freshSpells = () => makeSpells(spellRules.freezeUses, spellRules.jumpUses);
+  const gameIdRef = useRef(newGameId());
+  const startedAtRef = useRef(new Date().toISOString());
+  const archivedRef = useRef(false);
+  const [showArchive, setShowArchive] = useState(false);
   const [state, setState] = useState<GameState>(createInitialState());
   const [historyStates, setHistoryStates] = useState<SpellHistoryState[]>(() => {
     return [{ 
       state: createInitialState(), 
       frozenSquares: [], 
       activeJump: null,
-      spells: {
-        w: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 },
-        b: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 }
-      }
+      spells: freshSpells()
     }];
   });
   const [selectedMoveIndex, setSelectedMoveIndex] = useState<number | null>(null);
@@ -141,34 +160,63 @@ export function SpellMode({ onBack }: SpellModeProps) {
   const [legalMoves, setLegalMoves] = useState<Move[]>([]);
   const [status, setStatus] = useState<string | null>(null);
 
-  const [spells, setSpells] = useState<Record<Color, SpellsState>>({
-    w: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 },
-    b: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 }
-  });
+  const [spells, setSpells] = useState<Record<Color, SpellsState>>(freshSpells);
 
   const [selectedSpell, setSelectedSpell] = useState<'freeze' | 'jump' | null>(null);
+  const [spellNotice, setSpellNotice] = useState<string>('');
   
-  const [frozenSquares, setFrozenSquares] = useState<{ r: number; c: number; castBy: Color }[]>([]);
+  const [frozenSquares, setFrozenSquares] = useState<FrozenSquare[]>([]);
   const [activeJump, setActiveJump] = useState<Square | null>(null);
+  const [jumpAnimation, setJumpAnimation] = useState<SpellJumpAnimation | null>(null);
+  const spellEffectId = useRef(0);
   
   const [moveHistory, setMoveHistory] = useState<string[]>([]);
   const [showLog, setShowLog] = useState(false);
 
+  const archiveFinishedGame = (winner: Color | null, finalState: GameState, finalNotation: string, termination: string) => {
+    if (archivedRef.current) return;
+    const recordedPlies: ArchivePly[] = moveHistory.map((notation, index) => ({
+      notation,
+      action: actionForNotation(notation),
+      state: historyStates[index + 1]?.state ?? createInitialState(),
+    }));
+    recordedPlies.push({ notation: finalNotation, action: 'move', state: finalState });
+    const saved = saveArchivedGame({
+      id: gameIdRef.current,
+      mode: 'spellbound',
+      title: 'Spellbound',
+      players: { white: 'Noob 1', black: 'Noob 2' },
+      startedAt: startedAtRef.current,
+      endedAt: new Date().toISOString(),
+      result: winner === null ? '1/2-1/2' : winner === 'w' ? '1-0' : '0-1',
+      termination,
+      initialState: historyStates[0]?.state ?? createInitialState(),
+      plies: recordedPlies,
+    });
+    archivedRef.current = true;
+    if (!saved) setSpellNotice('Game ended, but the local archive could not save this record. Check browser storage space.');
+  };
+
   const handleSquareClick = (r: number, c: number, promotion?: PieceType) => {
-    if (status || selectedMoveIndex !== null) return;
+    if (status || selectedMoveIndex !== null || jumpAnimation) return;
 
     if (selectedSpell === 'freeze') {
-      // Apply freeze to 3x3
+      // Apply the configured radius, clipped to the board.
+      const castId = ++spellEffectId.current;
       const newFrozen = [...frozenSquares];
-      for (let dr = -1; dr <= 1; dr++) {
-        for (let dc = -1; dc <= 1; dc++) {
-          newFrozen.push({ r: r + dr, c: c + dc, castBy: state.turn });
+      for (let dr = -spellRules.freezeRadius; dr <= spellRules.freezeRadius; dr++) {
+        for (let dc = -spellRules.freezeRadius; dc <= spellRules.freezeRadius; dc++) {
+          const fr = r + dr; const fc = c + dc;
+          if (fr >= 0 && fr < 8 && fc >= 0 && fc < 8) newFrozen.push({ r: fr, c: fc, castBy: state.turn, remainingTurns: spellRules.freezeDurationTurns, castId, center: { r, c } });
         }
       }
       setFrozenSquares(newFrozen);
+      const center = `${String.fromCharCode(97 + c)}${8 - r}`;
+      const affected = new Set(newFrozen.filter(sq => Math.abs(sq.r - r) <= spellRules.freezeRadius && Math.abs(sq.c - c) <= spellRules.freezeRadius).map(sq => `${sq.r},${sq.c}`)).size;
+      setSpellNotice(`Frostbite cast on ${center}. ${affected} board squares frozen for ${spellRules.freezeDurationTurns} opponent turn${spellRules.freezeDurationTurns === 1 ? '' : 's'}.`);
       const nextSpells = {
         ...spells,
-        [state.turn]: { ...spells[state.turn], freezeLeft: spells[state.turn].freezeLeft - 1, freezeCooldown: 3 }
+        [state.turn]: { ...spells[state.turn], freezeLeft: spells[state.turn].freezeLeft - 1, freezeCooldown: spellRules.freezeCooldown }
       };
       setSpells(nextSpells);
       const freezeMsg = `[Freeze ${String.fromCharCode(97+c)}${8-r}]`;
@@ -188,9 +236,10 @@ export function SpellMode({ onBack }: SpellModeProps) {
       if (p && p.color === state.turn) {
         const nextJump = { r, c };
         setActiveJump(nextJump);
+        setSpellNotice(`${state.turn === 'w' ? 'White' : 'Black'} phased ${state.board[r][c]?.type.toUpperCase()} on ${String.fromCharCode(97 + c)}${8-r}. It can pass through pieces on its next move, then the effect expires.`);
         const nextSpells = {
           ...spells,
-          [state.turn]: { ...spells[state.turn], jumpLeft: spells[state.turn].jumpLeft - 1, jumpCooldown: 3 }
+          [state.turn]: { ...spells[state.turn], jumpLeft: spells[state.turn].jumpLeft - 1, jumpCooldown: spellRules.jumpCooldown }
         };
         setSpells(nextSpells);
         const jumpMsg = `[Jump ${String.fromCharCode(97+c)}${8-r}]`;
@@ -209,17 +258,34 @@ export function SpellMode({ onBack }: SpellModeProps) {
     // Normal move logic
     const move = legalMoves.find(m => m.to.r === r && m.to.c === c && (!m.promotion || m.promotion === promotion));
     if (move) {
+      const jumpWasActive = activeJump;
+      const movingPiece = state.board[move.from.r]?.[move.from.c];
+      if (jumpWasActive && movingPiece && jumpWasActive.r === move.from.r && jumpWasActive.c === move.from.c) {
+        setJumpAnimation({ id: ++spellEffectId.current, from: move.from, to: move.to, piece: movingPiece.type, color: movingPiece.color });
+      }
+      const nextState = applyMove(state, move);
       // Check King Capture!
       const targetP = state.board[r][c];
-      let san = moveToSAN(state, move, undefined, { ignoreCheck: true, jumpSquare: activeJump, frozenSquares: frozenSquares });
+      let san = moveToSAN(state, move, undefined, { ignoreCheck: true, jumpSquare: activeJump, phaseJump: !!jumpWasActive, frozenSquares: frozenSquares });
       if (targetP?.type === 'k') {
         san += "#";
         setStatus(`${state.turn === 'w' ? 'White' : 'Black'} Wins by King Capture!`);
+        archiveFinishedGame(state.turn, nextState, san, 'King capture');
+      } else if (isCheckmate(nextState)) {
+        san += "#";
+        setStatus(`${state.turn === 'w' ? 'White' : 'Black'} Wins by Checkmate!`);
+        archiveFinishedGame(state.turn, nextState, san, 'Checkmate');
+      } else if (isStalemate(nextState)) {
+        setStatus('Draw by Stalemate.');
+        archiveFinishedGame(null, nextState, san, 'Stalemate');
       }
       setMoveHistory(prev => [...prev, san]);
 
-      const nextState = applyMove(state, move);
-      const nextFrozen = frozenSquares.filter(f => f.castBy === state.turn);
+      const nextFrozen = frozenSquares.flatMap(f => {
+        if (f.castBy === state.turn) return [f];
+        const remainingTurns = f.remainingTurns - 1;
+        return remainingTurns > 0 ? [{ ...f, remainingTurns }] : [];
+      });
       const nextSpells = {
         ...spells,
         [state.turn]: {
@@ -240,6 +306,10 @@ export function SpellMode({ onBack }: SpellModeProps) {
       setSelectedSquare(null);
       setLegalMoves([]);
       setActiveJump(null); // expires after turn
+      if (jumpWasActive) setSpellNotice(`${state.turn === 'w' ? 'White' : 'Black'} used the phase jump. The effect has expired.`);
+      else if (frozenSquares.length > nextFrozen.length) {
+        setSpellNotice(nextFrozen.length === 0 ? 'The frost has melted. Frozen squares are clear.' : 'The frost recedes; remaining frozen squares are still marked on the board.');
+      }
 
       // Clean expired frozen squares
       setFrozenSquares(nextFrozen);
@@ -252,6 +322,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
       setLegalMoves(getLegalMoves(state, r, c, {
         ignoreCheck: true,
         jumpSquare: activeJump,
+        phaseJump: !!activeJump && activeJump.r === r && activeJump.c === c,
         frozenSquares: frozenSquares
       }));
     } else {
@@ -260,46 +331,41 @@ export function SpellMode({ onBack }: SpellModeProps) {
     }
   };
 
-  const currentSpells = spells[state.turn];
-
   const restart = () => {
+    gameIdRef.current = newGameId();
+    startedAtRef.current = new Date().toISOString();
+    archivedRef.current = false;
     const freshState = createInitialState();
     setState(freshState);
     setHistoryStates([{ 
       state: freshState, 
       frozenSquares: [], 
       activeJump: null,
-      spells: {
-        w: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 },
-        b: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 }
-      }
+      spells: freshSpells()
     }]);
     setSelectedMoveIndex(null);
     setSelectedSquare(null);
     setLegalMoves([]);
     setStatus(null);
-    setSpells({
-      w: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 },
-      b: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 }
-    });
+    setSpells(freshSpells());
     setFrozenSquares([]);
     setActiveJump(null);
+    setJumpAnimation(null);
     setSelectedSpell(null);
     setMoveHistory([]);
+    setSpellNotice('');
   };
 
   const undo = () => {
     if (selectedMoveIndex !== null || moveHistory.length === 0) return;
+    setJumpAnimation(null);
     const newMoveHistory = moveHistory.slice(0, -1);
     const newHistoryStates = historyStates.slice(0, -1);
     const prevStateInfo = newHistoryStates[newHistoryStates.length - 1] || {
       state: createInitialState(),
       frozenSquares: [],
       activeJump: null,
-      spells: {
-        w: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 },
-        b: { freezeLeft: 5, jumpLeft: 2, freezeCooldown: 0, jumpCooldown: 0 }
-      }
+      spells: freshSpells()
     };
     setMoveHistory(newMoveHistory);
     setHistoryStates(newHistoryStates);
@@ -312,6 +378,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
     setSelectedSpell(null);
     setSelectedMoveIndex(null);
     setStatus(null);
+    setSpellNotice('');
   };
 
   const isFlipped = state.turn === 'b';
@@ -326,10 +393,12 @@ export function SpellMode({ onBack }: SpellModeProps) {
 
   const material = getMaterialState(displayState, false);
 
+  if (showArchive) return <GameArchive onClose={() => setShowArchive(false)} />;
+
   return (
-    <div className="flex w-full h-screen max-h-screen overflow-hidden p-2 sm:p-4 md:p-6 animate-in fade-in duration-300 isolate">
+    <div className="game-shell flex w-full h-screen max-h-screen overflow-hidden p-2 sm:p-4 md:p-6 animate-in fade-in duration-300 isolate">
       <div className="flex-1 flex flex-col items-center justify-between max-w-5xl mx-auto h-full w-full relative">
-        <div className="w-full flex justify-between items-center px-4 shrink-0">
+        <div className="game-header w-full flex justify-between items-center px-4 shrink-0">
           <Button onClick={onBack} variant="ghost" className="text-slate-400 hover:text-white hover:bg-white/5">
             <ArrowLeft className="w-5 h-5 mr-2" /> Back
           </Button>
@@ -337,6 +406,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
             Spellbound
           </div>
           <div className="flex gap-4 items-center">
+            <Button onClick={() => setShowArchive(true)} variant="outline" className="border-cyan-500/30 text-cyan-200 hover:bg-cyan-950/40">View archive</Button>
             <Button 
               onClick={undo} 
               disabled={moveHistory.length === 0 || isViewingHistory}
@@ -345,7 +415,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
             >
               <Undo2 className="w-4 h-4 mr-2" /> Undo
             </Button>
-            <Button onClick={() => setShowLog(!showLog)} variant="outline" className="text-slate-300 border-white/10 hover:bg-white/5">
+            <Button onClick={() => setShowLog(!showLog)} aria-expanded={showLog} aria-controls="move-log-panel" variant="outline" className="text-slate-300 border-white/10 hover:bg-white/5">
               <ListIcon className="w-4 h-4 mr-2" /> Move Log
             </Button>
             <Button onClick={restart} variant="outline" className="border-white/10 text-slate-300 hover:text-white hover:bg-white/5">
@@ -360,11 +430,17 @@ export function SpellMode({ onBack }: SpellModeProps) {
           </motion.div>
         )}
 
-        <div className="flex-1 flex flex-col lg:flex-row items-center lg:items-stretch justify-center gap-8 w-full min-h-0 overflow-hidden py-2">
+        {(spellNotice || frozenSquares.length > 0 || activeJump) && !isViewingHistory && (
+          <motion.div key={spellNotice} initial={{ opacity: 0, y: -5 }} animate={{ opacity: 1, y: 0 }} role="status" aria-live="polite" className="max-w-2xl w-full text-center rounded-xl border border-cyan-300/20 bg-slate-950/80 px-4 py-2 text-xs text-cyan-100 shadow-[0_0_24px_rgba(34,211,238,.08)]">
+            {spellNotice || (activeJump ? 'Phase is charged: the marked piece may pass through occupied squares for its next move.' : `${new Set(frozenSquares.map(s => `${s.r},${s.c}`)).size} squares remain frozen. Opponent turns left: ${Math.min(...frozenSquares.map(s => s.remainingTurns))}.`)}
+          </motion.div>
+        )}
+
+        <div className="game-layout flex-1 flex flex-col lg:flex-row items-center lg:items-stretch justify-center gap-8 w-full min-h-0 overflow-hidden py-2">
           
           {/* Main Board Column */}
           <div 
-            className="flex-1 flex flex-col items-center justify-center w-full min-h-0 h-full mx-auto"
+            className="game-board-column flex-1 flex flex-col items-center justify-center w-full min-h-0 h-full mx-auto"
             style={{ maxWidth: 'min(100%, calc(100vh - 220px))' }}
           >
             {isViewingHistory && (
@@ -393,7 +469,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
                />
             </div>
 
-            <div className="relative w-full flex-1 min-h-0 flex items-center justify-center">
+            <div className="game-board-stage relative w-full flex-1 min-h-0 flex items-center justify-center">
                <ChessBoard
                  state={displayState}
                  onSquareClick={isViewingHistory ? undefined : handleSquareClick}
@@ -402,18 +478,12 @@ export function SpellMode({ onBack }: SpellModeProps) {
                  flipped={isFlipped}
                  frozenSquares={displayFrozen}
                  jumpSquare={displayJump}
+                 animateSpellEffects={!isViewingHistory}
+                 jumpAnimation={isViewingHistory ? null : jumpAnimation}
+                 onJumpAnimationComplete={() => setJumpAnimation(null)}
                />
                 
-               {status && (
-                  <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 rounded-xl backdrop-blur-sm">
-                    <div className="bg-[#1A1A1E] p-10 rounded-3xl text-center shadow-2xl border border-white/10">
-                      <h2 className="text-3xl font-bold text-white mb-8 animate-pulse tracking-wide">{status}</h2>
-                      <Button onClick={restart} className="bg-cyan-600 hover:bg-cyan-500 text-white px-8 py-3 rounded-xl w-full">
-                        Play Again
-                      </Button>
-                    </div>
-                  </div>
-               )}
+               {status && <GameResultOverlay status={status} onRestart={restart} onBack={onBack} />}
             </div>
 
             <div className="w-full mt-2 shrink-0">
@@ -435,7 +505,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
               isActiveTurn={state.turn === topColor && !isViewingHistory}
               spellsState={spells[topColor]}
               selectedSpell={selectedSpell}
-              setSelectedSpell={setSelectedSpell}
+              setSelectedSpell={(next) => { setSelectedSquare(null); setLegalMoves([]); setSelectedSpell(next); }}
               activeJump={activeJump}
               status={status}
             />
@@ -446,7 +516,7 @@ export function SpellMode({ onBack }: SpellModeProps) {
               isActiveTurn={state.turn === bottomColor && !isViewingHistory}
               spellsState={spells[bottomColor]}
               selectedSpell={selectedSpell}
-              setSelectedSpell={setSelectedSpell}
+              setSelectedSpell={(next) => { setSelectedSquare(null); setLegalMoves([]); setSelectedSpell(next); }}
               activeJump={activeJump}
               status={status}
             />
